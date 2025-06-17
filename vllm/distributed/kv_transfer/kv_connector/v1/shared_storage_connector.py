@@ -14,6 +14,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.mla.common import MLACommonMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
@@ -149,6 +150,9 @@ class SharedStorageConnector(KVConnectorBase_V1):
                 "In connector.start_load_kv, but the attn_metadata is None")
             return
 
+        tp_rank = get_tensor_model_parallel_rank()
+        total_tp_ranks = get_tensor_model_parallel_world_size()
+            
         # Load the KV for each request each layer
         for request in metadata.requests:
             if request.is_store:
@@ -160,11 +164,39 @@ class SharedStorageConnector(KVConnectorBase_V1):
                 kv_cache_layer = attn_layer.kv_cache[\
                         forward_context.virtual_engine]
 
-                filename = self._generate_filename_debug(
-                    layer_name, request.token_ids)
-                kv_cache = safetensors.torch.load_file(
-                    filename)["kv_cache"].cuda()
-                inject_kv_into_layer(kv_cache_layer, kv_cache,
+                filename = self._generate_filename_debug(layer_name, request.token_ids)
+
+                # 找到所有分片文件（例如: "xxx.safetensors" -> "xxx_0.safetensors", "xxx_1.safetensors", ...）
+                base_filename = filename.replace(".safetensors", "")
+                file_pattern = f"{base_filename}.{{}}.safetensors"
+
+                # 获取所有存在的分片文件
+                files = []
+                i = 0
+                while True:
+                    current_file = file_pattern.format(i)
+                    if os.path.exists(current_file):
+                        files.append(current_file)
+                        i += 1
+                    else:
+                        break
+
+                if not files:
+                    logger.warning(f"No KV cache files found for {filename}")
+                    continue
+
+                # 加载所有分片并拼接
+                kv_cache_parts = [safetensors.torch.load_file(f)["kv_cache"].cuda() for f in files]
+                kv_cache = torch.cat(kv_cache_parts, dim=-1)
+
+                # 计算每个 TP rank 应该负责的维度
+                total_dim = kv_cache.shape[-1]
+                dim_per_rank = total_dim // total_tp_ranks
+
+                # 切片当前 TP rank 的部分
+                kv_cache_rank = kv_cache[:, :, dim_per_rank * tp_rank : dim_per_rank * (tp_rank + 1)]
+
+                inject_kv_into_layer(kv_cache_layer, kv_cache_rank,
                                      request.slot_mapping)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -210,6 +242,7 @@ class SharedStorageConnector(KVConnectorBase_V1):
 
         connector_metadata = self._get_connector_metadata()
         assert isinstance(connector_metadata, SharedStorageConnectorMetadata)
+        tp_rank = get_tensor_model_parallel_rank()
         for request in connector_metadata.requests:
             if request.is_store:
                 filename = self._generate_filename_debug(
@@ -217,6 +250,7 @@ class SharedStorageConnector(KVConnectorBase_V1):
                 kv_cache = extract_kv_from_layer(kv_layer,
                                                  request.slot_mapping)
                 tensors = {"kv_cache": kv_cache.detach().cpu()}
+                filename = filename.replace(".safetensors", f".{tp_rank}.safetensors")
                 safetensors.torch.save_file(tensors, filename)
 
     def wait_for_save(self):
